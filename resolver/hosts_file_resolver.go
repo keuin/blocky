@@ -2,9 +2,12 @@ package resolver
 
 import (
 	"fmt"
+	"github.com/fsnotify/fsnotify"
 	"net"
 	"os"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/0xERR0R/blocky/config"
@@ -32,6 +35,7 @@ type HostsFileResolver struct {
 	ttl            uint32
 	refreshPeriod  time.Duration
 	filterLoopback bool
+	muUpdate       sync.Mutex
 }
 
 func (r *HostsFileResolver) handleReverseDNS(request *model.Request) *model.Response {
@@ -149,6 +153,9 @@ func NewHostsFileResolver(cfg config.HostsFileConfig) *HostsFileResolver {
 		r.HostsFilePath = ""
 	} else {
 		go r.periodicUpdate()
+		if cfg.WatchUpdates {
+			go r.watchUpdates()
+		}
 	}
 
 	return &r
@@ -163,6 +170,11 @@ type host struct {
 //nolint:funlen
 func (r *HostsFileResolver) parseHostsFile() error {
 	const minColumnCount = 2
+
+	// this function is called from multiple goroutines,
+	// so we use lock to prevent concurrent update
+	r.muUpdate.Lock()
+	defer r.muUpdate.Unlock()
 
 	if r.HostsFilePath == "" {
 		return nil
@@ -225,6 +237,73 @@ func (r *HostsFileResolver) parseHostsFile() error {
 	r.hosts = newHosts
 
 	return nil
+}
+
+func (r *HostsFileResolver) watchUpdates() {
+	watcher, err := fsnotify.NewWatcher()
+	if err != nil {
+		util.LogOnError("cannot create file watcher, hosts file watcher is disabled", err)
+		return
+	}
+	logger := log.PrefixedLog(hostsFileResolverLogger)
+	defer func() {
+		err := watcher.Close()
+		if err != nil {
+			util.LogOnError("failed to close hosts file watcher", err)
+		}
+		logger.Info("hosts file watcher closed")
+	}()
+
+	err = watcher.Add(r.HostsFilePath)
+	if err != nil {
+		util.LogOnError("failed to watch hosts file, hosts file watcher is disabled", err)
+		return
+	}
+
+	// update event IDs, unique
+	chanUpdate := make(chan int32, 32)
+	defer close(chanUpdate)
+	updateEventID := &atomic.Int32{} // the last update event ID
+
+	go func() {
+		for id := range chanUpdate {
+			// file editors like vim, will generate multiple events in one update,
+			// so we wait for some time to ensure there are (likely) no following operations
+			time.Sleep(time.Millisecond * 250)
+			if updateEventID.Load() != id {
+				// if id has changed, there must be one new operation in channel
+				// ignore current one and continue checking the next one
+				continue
+			}
+			// the event is probably the last one in one update, load file content
+			logger.WithField("file", r.HostsFilePath).
+				WithField("source", "file_watcher").
+				Debug("refreshing hosts file")
+			util.LogOnError("can't refresh hosts file on update: ", r.parseHostsFile())
+		}
+	}()
+
+	logger.Debug("hosts file watcher started")
+	for {
+		select {
+		case event, ok := <-watcher.Events:
+			if !ok {
+				return
+			}
+			isWrite := event.Op&fsnotify.Write != 0
+			isCreate := event.Op&fsnotify.Create != 0
+			isRemove := event.Op&fsnotify.Remove != 0
+			isRename := event.Op&fsnotify.Rename != 0
+			if isWrite || isCreate || isRemove || isRename {
+				chanUpdate <- updateEventID.Add(1)
+			}
+		case err, ok := <-watcher.Errors:
+			util.LogOnError("error watching hosts file", err)
+			if !ok {
+				return
+			}
+		}
+	}
 }
 
 func (r *HostsFileResolver) periodicUpdate() {

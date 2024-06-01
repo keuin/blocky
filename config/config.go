@@ -656,6 +656,7 @@ type HostsFileConfig struct {
 	Filepath       string   `yaml:"filePath"`
 	HostsTTL       Duration `yaml:"hostsTTL" default:"1h"`
 	RefreshPeriod  Duration `yaml:"refreshPeriod" default:"1h"`
+	WatchUpdates   bool     `yaml:"watchUpdates" default:"false"`
 	FilterLoopback bool     `yaml:"filterLoopback"`
 }
 
